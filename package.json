@@ -1,12 +1,10 @@
 {
-  "name": "dom-pro-collector",
+  "name": "collector-to-supabase",
   "version": "1.0.0",
-  "description": "24/7 Binance → Supabase collector",
+  "description": "24/7 Binance BTCUSDT trade collector → Supabase",
   "main": "collector.js",
   "scripts": {
     "start": "node collector.js"
   },
-  "dependencies": {
-    "ws": "^8.13.0"
-  }
+  "dependencies": {}
 }
