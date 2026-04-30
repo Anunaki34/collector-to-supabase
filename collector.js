@@ -1,71 +1,126 @@
-const WebSocket = require('ws');
-const https = require('https');
+'use strict';
 
-// ===== CONFIGURATION (from environment) =====
-const SUPABASE_HOST = process.env.SUPABASE_HOST || 'lgqqvsbpoycdqzljhptu.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SYMBOL = process.env.SYMBOL || 'btcusdt';
-// ============================================
+const https      = require('https');
+const fs         = require('fs');
+const WebSocket  = require('./node_modules/ws');
 
-if (!SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('❌ SUPABASE_SERVICE_ROLE_KEY environment variable is required');
+// ── Configuration (read from environment) ─────────────────────────────────────
+const SUPABASE_HOST     = process.env.SUPABASE_HOST;
+const SUPABASE_KEY      = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SYMBOL            = process.env.SYMBOL || 'btcusdt';
+const HEALTHCHECK_URL   = process.env.HEALTHCHECK_PING_URL || '';
+const BINANCE_WS_URL    = `wss://stream.binance.com:9443/ws/${SYMBOL}@aggTrade`;
+
+// Validate required config
+if (!SUPABASE_HOST || !SUPABASE_KEY) {
+  console.error('❌ ERROR: SUPABASE_HOST and SUPABASE_SERVICE_ROLE_KEY must be set.');
+  console.error('Please create a .env file or export environment variables.');
   process.exit(1);
 }
 
-let tradeCount = 0;
+// ── Optional shutdown logger (writes to shutdown.log) ─────────────────────────
+function logShutdown(reason) {
+  const line = `${new Date().toISOString()} | ${reason}\n`;
+  try { fs.appendFileSync('shutdown.log', line); } catch (e) { /* ignore */ }
+}
+process.on('exit', (code) => logShutdown(`Exited with code ${code}`));
+process.on('uncaughtException', (err) => { logShutdown(`Uncaught: ${err.message}`); console.error(err); process.exit(1); });
+process.on('SIGTERM', () => { logShutdown('SIGTERM'); process.exit(0); });
+process.on('SIGINT',  () => { logShutdown('SIGINT');  process.exit(0); });
 
-function insertTrade(price, qty, isSell) {
-  const data = JSON.stringify({ price, qty, is_sell: isSell });
+// ── State ────────────────────────────────────────────────────────────────────
+let insertCount = 0;
+
+// ── Supabase insert ──────────────────────────────────────────────────────────
+function insertTrade(trade) {
+  const payload = JSON.stringify({
+    price:   parseFloat(trade.p),
+    qty:     parseFloat(trade.q),
+    is_sell: trade.m
+  });
+
   const options = {
     hostname: SUPABASE_HOST,
-    port: 443,
-    path: '/rest/v1/trades',
-    method: 'POST',
+    path:     '/rest/v1/trades',
+    method:   'POST',
     headers: {
-      'apikey': SUPABASE_SERVICE_ROLE_KEY,
-      'Authorization': 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY,
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(data),
-      'Prefer': 'return=minimal'
+      'Content-Type':   'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+      'apikey':          SUPABASE_KEY,
+      'Authorization':   `Bearer ${SUPABASE_KEY}`,
+      'Prefer':          'return=minimal'
     }
   };
 
   const req = https.request(options, (res) => {
-    let body = '';
-    res.on('data', chunk => body += chunk);
-    res.on('end', () => {
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        tradeCount++;
-        if (tradeCount % 10 === 0) {
-          console.log(`✅ Inserted ${tradeCount} trades`);
-        }
-      } else {
-        console.error(`❌ Insert failed (${res.statusCode}):`, body);
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      res.resume(); // drain to free socket
+      insertCount++;
+      if (insertCount % 10 === 0) {
+        console.log(`✅ Inserted ${insertCount} trades`);
       }
-    });
+    } else {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => {
+        console.error(`❌ Insert failed [${res.statusCode}]: ${body.trim()}`);
+      });
+    }
   });
 
-  req.on('error', (e) => {
-    console.error('❌ Request error:', e.message);
+  req.on('error', (err) => {
+    console.error(`❌ Request error: ${err.message}`);
   });
 
-  req.write(data);
+  req.write(payload);
   req.end();
 }
 
-function connect() {
-  const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${SYMBOL}@aggTrade`);
-
-  ws.on('open', () => console.log('🟢 WebSocket connected'));
-  ws.on('error', (err) => console.error('🔴 WS error:', err.message));
-  ws.on('close', () => setTimeout(connect, 3000));
-  ws.on('message', (raw) => {
-    try {
-      const t = JSON.parse(raw);
-      insertTrade(parseFloat(t.p), parseFloat(t.q), t.m);
-    } catch {}
+// ── Healthcheck ping ─────────────────────────────────────────────────────────
+function pingHealth() {
+  if (!HEALTHCHECK_URL) return;
+  https.get(HEALTHCHECK_URL, (res) => {
+    res.resume();
+  }).on('error', (err) => {
+    console.error(`⚠️  Healthcheck ping failed: ${err.message}`);
   });
 }
 
-console.log('🚀 Starting collector...');
+// ── WebSocket connection ─────────────────────────────────────────────────────
+function connect() {
+  const ws = new WebSocket(BINANCE_WS_URL);
+
+  ws.on('open', () => {
+    console.log(`🔌 Connected to Binance stream: ${SYMBOL}@aggTrade`);
+  });
+
+  ws.on('message', (data) => {
+    let trade;
+    try {
+      trade = JSON.parse(data);
+    } catch (e) {
+      console.error(`❌ JSON parse error: ${e.message}`);
+      return;
+    }
+
+    // Per‑trade log – keeps the process visibly alive
+    console.log(`📥 Trade: ${trade.p} ${trade.q}`);
+    insertTrade(trade);
+  });
+
+  ws.on('close', (code) => {
+    console.log(`⚠️  WebSocket closed (${code}). Reconnecting in 3s...`);
+    setTimeout(connect, 3000);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`❌ WebSocket error: ${err.message}`);
+    // 'close' will fire next, triggering reconnect
+  });
+}
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+console.log('🚀 Collector starting...');
+pingHealth();
+setInterval(pingHealth, 5 * 60 * 1000); // every 5 minutes
 connect();
